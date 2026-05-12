@@ -46,7 +46,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: false        # build only, no push
+          push: false
+          load: true        # build only, no push
           tags: cicd-demo:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
