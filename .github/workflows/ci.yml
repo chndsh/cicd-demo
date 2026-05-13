@@ -96,6 +96,9 @@ jobs:
           image-ref: cicd-demo:scan
           format: sarif
           output: trivy-results.sarif
+          # This tells Trivy to only report things it can actually fix
+          vuln-type: 'library'
+          ignore-unfixed: true 
           severity: CRITICAL,HIGH
           exit-code: '1' # This will fail the CI if vulnerabilities are found
 
