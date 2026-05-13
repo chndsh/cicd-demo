@@ -8,7 +8,6 @@ on:
   pull_request:
     branches: [main]
 
-# Global deny-all — jobs declare only what they need
 permissions: {}
 
 jobs:
@@ -16,10 +15,8 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -36,7 +33,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image (test only, no push)
+      - name: Build Docker image (test only)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -62,7 +59,6 @@ jobs:
             echo "Waiting... ($i)"
             sleep 1
           done
-
           node src/test.js
 
       - name: Cleanup
@@ -74,11 +70,9 @@ jobs:
     name: Vulnerability Scan
     runs-on: ubuntu-latest
     needs: test
-
     permissions:
       contents: read
       security-events: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -93,6 +87,7 @@ jobs:
           push: false
           tags: cicd-demo:scan
           load: true
+          # Pulls from the cache created in the 'test' job
           cache-from: type=gha
 
       - name: Run Trivy vulnerability scan
@@ -102,39 +97,32 @@ jobs:
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
-          exit-code: '1'
+          exit-code: '1' # This will fail the CI if vulnerabilities are found
 
       - name: Upload scan results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: always() # Upload results even if the scan failed (code 1)
         with:
           sarif_file: trivy-results.sarif
 
-  # ── Job 3: Push (TRUE OIDC — no secrets at all) ────────────
+  # ── Job 3: Push (Only runs if Scan & Test pass) ───────────
   push:
     name: Push to GHCR
     runs-on: ubuntu-latest
     needs: [test, scan]
-
-    # Only push on main branch or version tags — never on PRs
     if: github.event_name != 'pull_request'
-
     permissions:
       contents: read
-      # ▼▼▼ These two are the OIDC-specific permissions ▼▼▼
-      packages: write       # allows pushing to ghcr.io
-      id-token: write       # allows GitHub to mint an OIDC JWT for this job
-
+      packages: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Generate smart tags — same as before but pointing at ghcr.io
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # ghcr.io instead of docker.io — this is the only registry change
           images: ghcr.io/${{ github.repository_owner }}/cicd-demo
           tags: |
             type=ref,event=branch
@@ -144,22 +132,16 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # ▼▼▼ TRUE OIDC LOGIN — no username, no password, no secret ▼▼▼
       - name: Login to GHCR (OIDC)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          # github.actor = the user or bot that triggered the workflow
           username: ${{ github.actor }}
-          # GITHUB_TOKEN is NOT a stored secret — it's an OIDC-derived
-          # token minted fresh for this job by GitHub's token service.
-          # It expires when this job ends. It never exists in your settings.
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build, sign provenance, generate SBOM, and push
       - name: Build and push
         id: build-push
         uses: docker/build-push-action@v5
@@ -174,7 +156,6 @@ jobs:
           provenance: true
           sbom: true
 
-      # Keyless image signing — Cosign uses the OIDC token, no key needed
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
@@ -185,15 +166,8 @@ jobs:
           cosign sign --yes \
             ghcr.io/${{ github.repository_owner }}/cicd-demo@${DIGEST}
 
-      # Print summary to the Actions run page
       - name: Summary
         run: |
           echo "### 📦 Pushed to GHCR" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Registry:** \`ghcr.io/${{ github.repository_owner }}/cicd-demo\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" | \
-            tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ steps.build-push.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
