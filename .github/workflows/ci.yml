@@ -1,59 +1,52 @@
-# Workflow name — shows up in GitHub Actions tab
-name: CI
+name: CI / CD
 
-# When does this run?
 on:
   push:
-    branches: [main]       # on every push to main
+    branches: [main]
+    tags:
+      - 'v*.*.*'
   pull_request:
-    branches: [main]       # on every PR targeting main
+    branches: [main]
 
-# Global permissions — deny everything by default
-# Each job below only gets what it explicitly asks for
+# Global deny-all — jobs declare only what they need
 permissions: {}
 
 jobs:
+  # ── Job 1: Test ────────────────────────────────────────────
   test:
     name: Build & Test
-    runs-on: ubuntu-latest   # GitHub-hosted runner (free)
+    runs-on: ubuntu-latest
 
-    # This job only needs to read the repo
     permissions:
       contents: read
 
     steps:
-      # Step 1: Check out your code onto the runner
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Set up Node.js (matches your local version)
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'       # cache node_modules between runs
+          cache: 'npm'
 
-      # Step 3: Install dependencies
       - name: Install dependencies
         run: npm install --omit=dev
 
-      # Step 4: Set up Docker Buildx (needed for multi-platform builds later)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 5: Build the Docker image (don't push yet — just verify it builds)
-      - name: Build Docker image
+      - name: Build Docker image (test only, no push)
         uses: docker/build-push-action@v5
         with:
           context: .
           push: false
-          load: true        # build only, no push
           tags: cicd-demo:test
+          load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Step 6: Start the container and run the health check test
-      - name: Run container and test
+      - name: Start container and test
         run: |
           docker run -d \
             --name cicd-demo-test \
@@ -61,7 +54,6 @@ jobs:
             -e APP_ENV=ci \
             cicd-demo:test
 
-          # Wait for it to be ready (up to 15 seconds)
           for i in $(seq 1 15); do
             if curl -sf http://localhost:3000/health; then
               echo "✅ App is up"
@@ -71,10 +63,137 @@ jobs:
             sleep 1
           done
 
-          # Run the test script
           node src/test.js
 
-      # Step 7: Always clean up the container, even if tests fail
       - name: Cleanup
         if: always()
         run: docker stop cicd-demo-test && docker rm cicd-demo-test || true
+
+  # ── Job 2: Vulnerability Scan ──────────────────────────────
+  scan:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: cicd-demo:scan
+          load: true
+          cache-from: type=gha
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: cicd-demo:scan
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Upload scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── Job 3: Push (TRUE OIDC — no secrets at all) ────────────
+  push:
+    name: Push to GHCR
+    runs-on: ubuntu-latest
+    needs: [test, scan]
+
+    # Only push on main branch or version tags — never on PRs
+    if: github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+      # ▼▼▼ These two are the OIDC-specific permissions ▼▼▼
+      packages: write       # allows pushing to ghcr.io
+      id-token: write       # allows GitHub to mint an OIDC JWT for this job
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Generate smart tags — same as before but pointing at ghcr.io
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # ghcr.io instead of docker.io — this is the only registry change
+          images: ghcr.io/${{ github.repository_owner }}/cicd-demo
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # ▼▼▼ TRUE OIDC LOGIN — no username, no password, no secret ▼▼▼
+      - name: Login to GHCR (OIDC)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          # github.actor = the user or bot that triggered the workflow
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is NOT a stored secret — it's an OIDC-derived
+          # token minted fresh for this job by GitHub's token service.
+          # It expires when this job ends. It never exists in your settings.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build, sign provenance, generate SBOM, and push
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      # Keyless image signing — Cosign uses the OIDC token, no key needed
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (keyless via OIDC)
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository_owner }}/cicd-demo@${DIGEST}
+
+      # Print summary to the Actions run page
+      - name: Summary
+        run: |
+          echo "### 📦 Pushed to GHCR" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`ghcr.io/${{ github.repository_owner }}/cicd-demo\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | \
+            tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build-push.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
